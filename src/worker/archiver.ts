@@ -44,7 +44,7 @@ async function processTask(
   task: ImageTask
 ): Promise<void> {
   try {
-    const displayName = await fetchLineDisplayName(task.user_id, accessToken);
+    const displayName = await fetchLineDisplayName(task.user_id, accessToken, task.group_id);
     const uploadDate = msToDateString(task.line_timestamp);
 
     // Idempotent two-level folder: root / YYYY-MM-DD / displayName (SRS §6.3.2)
@@ -73,12 +73,22 @@ async function processTask(
     const code = (err as { code?: number }).code;
 
     if (code === 404 || (err as Error).message === 'NOT_FOUND') {
-      // User deleted / blocked — stop retrying permanently (SRS §4.2.2 / §6.3.3)
-      await pool.query(
-        `UPDATE image_tasks SET status = 'blocked', updated_at = NOW() WHERE id = $1`,
-        [task.id]
-      );
-      console.warn(`[archiver] Blocked user for task ${task.message_id}, marked as blocked.`);
+      if (task.group_id) {
+        // In group context: 404 means the user left the group or the content expired.
+        // NOT a permanent block — mark as failed and stop retrying to avoid wasted quota.
+        await pool.query(
+          `UPDATE image_tasks SET status = 'failed', updated_at = NOW() WHERE id = $1`,
+          [task.id]
+        );
+        console.warn(`[archiver] 404 in group context for task ${task.message_id} (user left or content expired), marked as failed.`);
+      } else {
+        // In DM context: 404 means the user blocked the bot — stop retrying permanently.
+        await pool.query(
+          `UPDATE image_tasks SET status = 'blocked', updated_at = NOW() WHERE id = $1`,
+          [task.id]
+        );
+        console.warn(`[archiver] Blocked user for task ${task.message_id}, marked as blocked.`);
+      }
       return;
     }
 
@@ -164,10 +174,24 @@ async function markTaskDone(pool: Pool, taskId: number): Promise<void> {
   );
 }
 
-async function fetchLineDisplayName(userId: string, accessToken: string): Promise<string> {
-  const res = await fetch(`https://api.line.me/v2/bot/profile/${userId}`, {
+/**
+ * Fetches display name using the correct endpoint based on context:
+ * - Group message → /group/{groupId}/member/{userId}  (no friend relationship needed)
+ * - Direct message → /profile/{userId}                (requires friend)
+ */
+async function fetchLineDisplayName(
+  userId: string,
+  accessToken: string,
+  groupId?: string | null
+): Promise<string> {
+  const url = groupId
+    ? `https://api.line.me/v2/bot/group/${groupId}/member/${userId}`
+    : `https://api.line.me/v2/bot/profile/${userId}`;
+
+  const res = await fetch(url, {
     headers: { Authorization: `Bearer ${accessToken}` },
   });
+
   if (res.status === 404) throw Object.assign(new Error('NOT_FOUND'), { code: 404 });
   if (!res.ok) throw new Error(`LINE_PROFILE_HTTP_${res.status}`);
   const data = (await res.json()) as { displayName: string };
